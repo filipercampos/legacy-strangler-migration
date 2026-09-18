@@ -9,8 +9,9 @@ module.exports = {
       ...common,
       displayName: 'integration',
       testMatch: ['<rootDir>/test/**/*.int-spec.ts'],
-      testTimeout: 180000,
     },
   ],
+  // Integration suites start SQL Server; unit tests are far below this.
+  testTimeout: 180000,
   collectCoverageFrom: ['src/**/*.ts', '!src/**/main.ts', '!src/**/*.module.ts'],
 };
