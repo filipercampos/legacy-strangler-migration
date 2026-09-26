@@ -43,7 +43,27 @@ export interface InvoicesTable {
   updated_at: Timestamp;
 }
 
+export interface SyncCheckpointsTable {
+  stream: string;
+  position: bigint;
+  updated_at: Timestamp;
+}
+
+export interface SyncDeadLettersTable {
+  id: Generated<bigint>;
+  stream: string;
+  legacy_id: number;
+  source_version: bigint;
+  reason: string;
+  detail: string | null;
+  payload: ColumnType<unknown, string | null, string | null>;
+  created_at: Generated<Date>;
+  resolved_at: Date | null;
+}
+
 export interface Database {
   customers: CustomersTable;
   invoices: InvoicesTable;
+  sync_checkpoints: SyncCheckpointsTable;
+  sync_dead_letters: SyncDeadLettersTable;
 }
