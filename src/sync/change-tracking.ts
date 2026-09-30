@@ -120,6 +120,32 @@ export class ChangeTrackingSource {
     }
   }
 
+  /** Keyset page of base rows for the backfill (READ COMMITTED, short statements). */
+  async readPage<S extends StreamName>(
+    stream: S,
+    afterKey: number,
+    limit: number,
+  ): Promise<RowFor<S>[]> {
+    const def = TABLES[stream];
+    const result = await this.pool
+      .request()
+      .input('after', sql.Int, afterKey)
+      .input('limit', sql.Int, limit)
+      .query<RowFor<S>>(
+        `SELECT TOP (@limit) ${def.columns}
+           FROM ${def.table} AS t
+          WHERE t.${def.pk} > @after
+          ORDER BY t.${def.pk}`,
+      );
+    return result.recordset;
+  }
+
+  keyOf(stream: StreamName, row: LegacyCustomerRow | LegacyInvoiceRow): number {
+    return stream === 'customers'
+      ? (row as LegacyCustomerRow).CUST_ID
+      : (row as LegacyInvoiceRow).INV_ID;
+  }
+
   async currentVersion(): Promise<bigint> {
     const result = await this.pool
       .request()

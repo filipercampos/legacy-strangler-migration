@@ -16,9 +16,12 @@ import {
 } from './legacy-formats';
 import { modernIdFor } from './legacy-ids';
 
-export type CustomerTranslation =
-  | { kind: 'upsert'; customer: Customer; issues: string[] }
-  | { kind: 'tombstone'; legacyId: number; tenantId: string; issues: string[] };
+export interface CustomerTranslation {
+  customer: Customer;
+  /** Soft-deleted in legacy (CUST_STAT = 'X'): kept as a tombstone so invoices still attach. */
+  deleted: boolean;
+  issues: string[];
+}
 
 /**
  * Inbound half of the anti-corruption layer: legacy rows → domain aggregates.
@@ -32,9 +35,6 @@ export function translateCustomer(row: LegacyCustomerRow): CustomerTranslation {
   const issues: string[] = [];
   const state = customerStatusFromLegacy(row.CUST_STAT);
   const tenantId = row.CO_CODE.trim();
-  if (state.kind === 'deleted') {
-    return { kind: 'tombstone', legacyId: row.CUST_ID, tenantId, issues };
-  }
 
   const name = row.CUST_NAME?.trim();
   if (!name) throw new AclRejection('customer_name_missing', `CUST_ID ${row.CUST_ID} has no name`);
@@ -60,13 +60,14 @@ export function translateCustomer(row: LegacyCustomerRow): CustomerTranslation {
     name,
     email: lenient(row.EMAIL, parseEmail, 'email_invalid', issues),
     document: lenient(row.DOC_NUM, taxDocument, 'document_invalid', issues),
-    status: state.status,
+    // The status before deletion is unknown; a deleted customer is at least closed.
+    status: state.kind === 'live' ? state.status : { kind: 'closed' },
     registeredOn: registered.value,
     city: row.CITY?.trim() || null,
     state: validState,
     plan: row.PLAN_CD?.trim() ? { code: row.PLAN_CD.trim(), priceCents: price ?? 0n } : null,
   });
-  return { kind: 'upsert', customer, issues };
+  return { customer, deleted: state.kind === 'deleted', issues };
 }
 
 export interface InvoiceTranslation {

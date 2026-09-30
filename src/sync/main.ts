@@ -6,6 +6,7 @@ import { pino } from 'pino';
 import { connectLegacyDb, legacyDbOptionsFromEnv } from '../legacy/db/connection';
 import { loadEnv, syncEnvSchema } from '../shared/config/env';
 import { createDatabase } from '../shared/database/database';
+import { Backfill } from './backfill';
 import { CdcWorker } from './cdc-worker';
 import { ChangeTrackingSource, RetentionExceededError } from './change-tracking';
 
@@ -54,6 +55,17 @@ async function main(command: string | undefined): Promise<void> {
             await sleep(backoff, undefined, { signal: abort.signal }).catch(() => undefined);
           }
         }
+        break;
+      }
+      case 'backfill': {
+        const report = await new Backfill(db, new ChangeTrackingSource(legacy), logger, {
+          batchSize: env.BACKFILL_BATCH_SIZE,
+          maxRowsPerSecond: env.BACKFILL_MAX_ROWS_PER_SECOND,
+        }).run();
+        logger.info(
+          { ...report, snapshotVersion: report.snapshotVersion.toString() },
+          'backfill report',
+        );
         break;
       }
       default:

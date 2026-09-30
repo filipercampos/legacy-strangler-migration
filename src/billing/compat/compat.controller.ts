@@ -54,8 +54,11 @@ export class CompatController {
     @TenantId() tenantId: string,
     @Param('id') id: string,
   ): Promise<{ Items: LegacyInvoiceDto[] }> {
-    const customer = await this.repository.findCustomerByLegacyId(tenantId, parseLegacyId(id));
-    // Legacy returns an empty list (not 404) for unknown customers; preserve that.
+    // Legacy lists invoices of soft-deleted customers too, and returns an empty list (not
+    // 404) for unknown customers; preserve both.
+    const customer = await this.repository.findCustomerByLegacyId(tenantId, parseLegacyId(id), {
+      includeDeleted: true,
+    });
     if (!customer) return { Items: [] };
     const snapshot = customer.snapshot;
     const today = this.clock.today();

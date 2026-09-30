@@ -21,14 +21,18 @@ export class BillingRepository {
     return row ? customerFromRow(row) : null;
   }
 
-  async findCustomerByLegacyId(tenantId: string, legacyId: number): Promise<Customer | null> {
-    const row = await this.db
+  async findCustomerByLegacyId(
+    tenantId: string,
+    legacyId: number,
+    options: { includeDeleted?: boolean } = {},
+  ): Promise<Customer | null> {
+    let query = this.db
       .selectFrom('customers')
       .selectAll()
       .where('tenant_id', '=', tenantId)
-      .where('legacy_id', '=', legacyId)
-      .where('deleted_at', 'is', null)
-      .executeTakeFirst();
+      .where('legacy_id', '=', legacyId);
+    if (!options.includeDeleted) query = query.where('deleted_at', 'is', null);
+    const row = await query.executeTakeFirst();
     return row ? customerFromRow(row) : null;
   }
 

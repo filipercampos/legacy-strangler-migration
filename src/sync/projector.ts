@@ -51,6 +51,20 @@ export class Projector {
       await this.projectInvoices(trx, live, stats, deadLetters);
     }
 
+    // A row that now applies cleanly closes its earlier dead letters (e.g. an invoice that
+    // looked orphaned during the backfill because its customer was created mid-copy).
+    const rejected = new Set(deadLetters.map((letter) => letter.legacyId));
+    const healed = live.map((change) => change.key).filter((key) => !rejected.has(key));
+    if (healed.length > 0) {
+      await trx
+        .updateTable('sync_dead_letters')
+        .set({ resolved_at: sql<Date>`now()` })
+        .where('stream', '=', stream)
+        .where('legacy_id', 'in', healed)
+        .where('resolved_at', 'is', null)
+        .execute();
+    }
+
     if (deadLetters.length > 0) {
       await trx
         .insertInto('sync_dead_letters')
@@ -86,18 +100,14 @@ export class Projector {
       }
       try {
         const result = translateCustomer(change.row);
-        if (result.kind === 'tombstone') {
-          tombstones.push({ legacyId: change.key, version: change.version });
-        } else {
-          const snapshot = result.customer.snapshot;
-          upserts.push({
-            id: snapshot.id,
-            ...customerColumns(snapshot),
-            data_issues: result.issues,
-            source_version: change.version,
-            deleted_at: null,
-          });
-        }
+        const snapshot = result.customer.snapshot;
+        upserts.push({
+          id: snapshot.id,
+          ...customerColumns(snapshot),
+          data_issues: result.issues,
+          source_version: change.version,
+          deleted_at: result.deleted ? new Date() : null,
+        });
       } catch (error) {
         deadLetters.push(rejection(change, error));
       }
@@ -125,7 +135,7 @@ export class Projector {
               plan_price_cents: eb.ref('excluded.plan_price_cents'),
               data_issues: eb.ref('excluded.data_issues'),
               source_version: eb.ref('excluded.source_version'),
-              deleted_at: null,
+              deleted_at: eb.ref('excluded.deleted_at'),
               updated_at: sql<Date>`now()`,
             }))
             .where('customers.source_version', '<', (eb) => eb.ref('excluded.source_version')),

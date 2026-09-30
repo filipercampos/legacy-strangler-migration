@@ -77,7 +77,7 @@ describe('status codes', () => {
 describe('inbound translation', () => {
   it('normalizes a messy customer row and records what it repaired', () => {
     const result = translateCustomer(customerRow({ DOC_NUM: 'ISENTO' }));
-    if (result.kind !== 'upsert') throw new Error('expected upsert');
+    expect(result.deleted).toBe(false);
     const customer = result.customer.snapshot;
     expect(customer.id).toBe(modernIdFor('customer', 17));
     expect(customer.email).toBe('customer17@example.com');
@@ -88,13 +88,10 @@ describe('inbound translation', () => {
     expect(result.issues).toEqual(['document_invalid']);
   });
 
-  it('turns soft-deleted rows into tombstones', () => {
-    expect(translateCustomer(customerRow({ CUST_STAT: 'X' }))).toEqual({
-      kind: 'tombstone',
-      legacyId: 17,
-      tenantId: 'ACME',
-      issues: [],
-    });
+  it('keeps soft-deleted rows as closed tombstones so their invoices still attach', () => {
+    const result = translateCustomer(customerRow({ CUST_STAT: 'X' }));
+    expect(result.deleted).toBe(true);
+    expect(result.customer.snapshot.status).toEqual({ kind: 'closed' });
   });
 
   it('maps overdue to open and keeps paid invoices without a date', () => {
@@ -117,7 +114,6 @@ describe('inbound translation', () => {
 describe('outbound translation', () => {
   it('emits the legacy contract from the domain', () => {
     const translated = translateCustomer(customerRow());
-    if (translated.kind !== 'upsert') throw new Error('expected upsert');
     expect(customerToLegacy(translated.customer.snapshot)).toEqual({
       CustId: 17,
       CoCode: 'ACME',
