@@ -20,7 +20,8 @@
     "migrate": "tsx --env-file-if-exists=.env src/shared/database/migrate.ts",
     "start:billing": "node --env-file-if-exists=.env dist/billing/main.js",
     "sync:backfill": "node --env-file-if-exists=.env dist/sync/main.js backfill",
-    "sync:cdc": "node --env-file-if-exists=.env dist/sync/main.js cdc"
+    "sync:cdc": "node --env-file-if-exists=.env dist/sync/main.js cdc",
+    "start:gateway": "node --env-file-if-exists=.env dist/gateway/main.js"
   },
   "dependencies": {
     "@nestjs/common": "^11.2.3",

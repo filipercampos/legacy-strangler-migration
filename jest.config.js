@@ -1,5 +1,5 @@
 /** @type {import('jest').Config} */
-const transform = { '^.+\.ts$': 'ts-jest' };
+const transform = { '^.+\\.ts$': 'ts-jest' };
 const common = { testEnvironment: 'node', moduleFileExtensions: ['js', 'json', 'ts'], transform };
 
 module.exports = {

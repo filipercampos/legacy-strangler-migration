@@ -61,9 +61,48 @@ export interface SyncDeadLettersTable {
   resolved_at: Date | null;
 }
 
+export type Entity = 'customers' | 'invoices';
+export type Owner = 'legacy' | 'modern';
+
+export interface RoutingRulesTable {
+  route_id: string;
+  tenant_id: string;
+  modern_percent: number;
+  shadow_percent: number;
+  updated_at: Timestamp;
+  updated_by: string;
+}
+
+export interface EntityOwnershipTable {
+  entity: Entity;
+  tenant_id: string;
+  owner: Owner;
+  changed_at: Timestamp;
+  changed_by: string;
+}
+
+export interface GatewaySettingsTable {
+  id: Generated<boolean>;
+  kill_switch: boolean;
+  updated_at: Timestamp;
+  updated_by: string;
+}
+
+export interface RoutingAuditTable {
+  id: Generated<bigint>;
+  actor: string;
+  action: string;
+  detail: ColumnType<unknown, string, never>;
+  created_at: Generated<Date>;
+}
+
 export interface Database {
   customers: CustomersTable;
   invoices: InvoicesTable;
   sync_checkpoints: SyncCheckpointsTable;
   sync_dead_letters: SyncDeadLettersTable;
+  routing_rules: RoutingRulesTable;
+  entity_ownership: EntityOwnershipTable;
+  gateway_settings: GatewaySettingsTable;
+  routing_audit: RoutingAuditTable;
 }
