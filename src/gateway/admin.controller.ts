@@ -20,6 +20,7 @@ import type { GatewayEnv } from '../shared/config/env';
 import { ENV } from '../shared/nest/tokens';
 import { FlagStore } from './flag-store';
 import { ROUTES } from './routes';
+import { ShadowRunner } from './shadow/shadow-runner';
 
 /**
  * Admin endpoints are reachable only on the internal ALB listener restricted to the ops VPN
@@ -74,7 +75,16 @@ function parse<T>(schema: z.ZodType<T>, body: unknown): T {
 @Controller('admin')
 @UseGuards(AdminGuard)
 export class AdminController {
-  constructor(private readonly flags: FlagStore) {}
+  constructor(
+    private readonly flags: FlagStore,
+    private readonly shadow: ShadowRunner,
+  ) {}
+
+  /** Per-route shadow comparison counters of this task (CloudWatch has the fleet view). */
+  @Get('shadow/stats')
+  shadowStats() {
+    return this.shadow.snapshot();
+  }
 
   @Get('flags')
   async current() {

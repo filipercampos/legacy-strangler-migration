@@ -6,6 +6,7 @@ import { emitMetrics } from '../shared/observability/metrics';
 import { FlagStore } from './flag-store';
 import { decide, type Decision, type Target } from './flags';
 import { matchRoute } from './routes';
+import { ShadowRunner } from './shadow/shadow-runner';
 import { UpstreamClient, type UpstreamRequest, type UpstreamResponse } from './upstream';
 
 /**
@@ -20,6 +21,7 @@ export class FacadeController {
   constructor(
     private readonly flags: FlagStore,
     private readonly upstream: UpstreamClient,
+    private readonly shadow: ShadowRunner,
     @Inject(ENV) private readonly env: GatewayEnv,
   ) {}
 
@@ -84,5 +86,18 @@ export class FacadeController {
     res.setHeader('x-route-reason', decision.reason);
     if (response.contentType) res.setHeader('content-type', response.contentType);
     res.status(response.status).send(response.body);
+
+    // Compare against the other side after the caller has its answer (reads only, by design
+    // of decide(); skipped after a fallback because the "other side" just failed).
+    if (decision.shadow && matched && res.getHeader('x-fallback') === undefined) {
+      this.shadow.schedule({
+        routeId,
+        tenantId,
+        resourceId: matched.resourceId,
+        request: upstreamRequest,
+        served,
+        primary: response,
+      });
+    }
   }
 }

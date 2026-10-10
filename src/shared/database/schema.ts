@@ -96,6 +96,17 @@ export interface RoutingAuditTable {
   created_at: Generated<Date>;
 }
 
+export interface ShadowMismatchesTable {
+  id: Generated<bigint>;
+  route_id: string;
+  tenant_id: string;
+  resource_id: string | null;
+  request_id: string | null;
+  served_by: string;
+  diff: ColumnType<unknown, string, never>;
+  created_at: Generated<Date>;
+}
+
 export interface Database {
   customers: CustomersTable;
   invoices: InvoicesTable;
@@ -105,4 +116,5 @@ export interface Database {
   entity_ownership: EntityOwnershipTable;
   gateway_settings: GatewaySettingsTable;
   routing_audit: RoutingAuditTable;
+  shadow_mismatches: ShadowMismatchesTable;
 }

@@ -2,12 +2,14 @@ import { type Kysely, type Migration, type MigrationProvider, Migrator } from 'k
 import * as m0001 from './migrations/0001_billing_core';
 import * as m0002 from './migrations/0002_sync';
 import * as m0003 from './migrations/0003_routing';
+import * as m0004 from './migrations/0004_shadow';
 
 /** Static provider: migrations are bundled with the code, no filesystem scanning at runtime. */
 const migrations: Record<string, Migration> = {
   '0001_billing_core': m0001,
   '0002_sync': m0002,
   '0003_routing': m0003,
+  '0004_shadow': m0004,
 };
 
 class StaticMigrationProvider implements MigrationProvider {
