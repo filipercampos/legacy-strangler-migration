@@ -1,17 +1,26 @@
 import {
+  BadRequestException,
+  Body,
   Controller,
   Get,
   HttpCode,
   NotFoundException,
   Param,
+  Post,
+  Put,
   Query,
   UseFilters,
 } from '@nestjs/common';
 import { customerToLegacy, invoiceToLegacy } from '../../acl/outbound';
-import type { LegacyCustomerDto, LegacyInvoiceDto } from '../../legacy/contract';
+import type {
+  LegacyCustomerDto,
+  LegacyCustomerInput,
+  LegacyInvoiceDto,
+} from '../../legacy/contract';
 import { parseLegacyId, TenantId } from '../api/tenant';
 import { Clock } from '../clock';
 import { BillingRepository } from '../persistence/billing.repository';
+import { CustomerWriteService } from './customer-writes.service';
 import { LegacyErrorFilter } from './legacy-error.filter';
 
 /**
@@ -25,7 +34,27 @@ export class CompatController {
   constructor(
     private readonly repository: BillingRepository,
     private readonly clock: Clock,
+    private readonly writes: CustomerWriteService,
   ) {}
+
+  /** Accepted only while modern owns customer writes for the tenant (409 otherwise). */
+  @Post()
+  async create(
+    @TenantId() tenantId: string,
+    @Body() body: LegacyCustomerInput,
+  ): Promise<LegacyCustomerDto> {
+    return this.writes.save(tenantId, null, requireName(body));
+  }
+
+  @Put(':id')
+  @HttpCode(200)
+  async update(
+    @TenantId() tenantId: string,
+    @Param('id') id: string,
+    @Body() body: LegacyCustomerInput,
+  ): Promise<LegacyCustomerDto> {
+    return this.writes.save(tenantId, parseLegacyId(id), requireName(body));
+  }
 
   @Get()
   async list(
@@ -73,4 +102,11 @@ export class CompatController {
       ),
     };
   }
+}
+
+function requireName(body: LegacyCustomerInput): LegacyCustomerInput {
+  if (typeof body?.Name !== 'string' || body.Name.trim() === '') {
+    throw new BadRequestException('NAME_REQUIRED');
+  }
+  return body;
 }

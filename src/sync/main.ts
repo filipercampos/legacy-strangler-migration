@@ -9,6 +9,7 @@ import { createDatabase } from '../shared/database/database';
 import { Backfill } from './backfill';
 import { CdcWorker } from './cdc-worker';
 import { ChangeTrackingSource, RetentionExceededError } from './change-tracking';
+import { ReverseSync } from './reverse-sync';
 
 /**
  * Sync worker entrypoint (ECS service in AWS). Usage:
@@ -66,6 +67,17 @@ async function main(command: string | undefined): Promise<void> {
           { ...report, snapshotVersion: report.snapshotVersion.toString() },
           'backfill report',
         );
+        break;
+      }
+      case 'reverse': {
+        const reverse = new ReverseSync(db, legacy, logger, { batchSize: env.SYNC_BATCH_SIZE });
+        while (!abort.signal.aborted) {
+          const result = await reverse.runPass();
+          if (result.synced > 0 && result.failed === 0) continue;
+          await sleep(env.SYNC_POLL_INTERVAL_MS, undefined, { signal: abort.signal }).catch(
+            () => undefined,
+          );
+        }
         break;
       }
       default:

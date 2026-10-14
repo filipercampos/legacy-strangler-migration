@@ -37,9 +37,33 @@ export class Projector {
   ): Promise<ProjectionStats> {
     const stats: ProjectionStats = { applied: 0, tombstoned: 0, deadLettered: 0, echoesSkipped: 0 };
     const deadLetters: DeadLetter[] = [];
+    // Single writer (ADR 0003): once modern owns an entity for a tenant, a legacy change to
+    // it is a split-brain write (a forgotten caller, a SQL Agent job, a trigger). It is not
+    // applied; it is dead-lettered and alarmed so the hidden writer gets found.
+    const modernOwned = new Set(
+      (
+        await trx
+          .selectFrom('entity_ownership')
+          .select('tenant_id')
+          .where('entity', '=', stream)
+          .where('owner', '=', 'modern')
+          .execute()
+      ).map((row) => row.tenant_id),
+    );
     const live = changes.filter((change) => {
       if (change.context === SYNC_CONTEXT) {
         stats.echoesSkipped += 1;
+        return false;
+      }
+      const tenant = change.row?.CO_CODE.trim();
+      if (tenant !== undefined && modernOwned.has(tenant)) {
+        deadLetters.push({
+          legacyId: change.key,
+          version: change.version,
+          reason: 'write_to_non_owner',
+          detail: `${stream} for ${tenant} are owned by modern; legacy change ignored`,
+          payload: change.row,
+        });
         return false;
       }
       return true;

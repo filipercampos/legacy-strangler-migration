@@ -107,6 +107,17 @@ export interface ShadowMismatchesTable {
   created_at: Generated<Date>;
 }
 
+export interface ReverseSyncOutboxTable {
+  id: Generated<bigint>;
+  entity: 'customers';
+  legacy_id: number;
+  payload: ColumnType<unknown, string, never>;
+  attempts: Generated<number>;
+  last_error: string | null;
+  created_at: Generated<Date>;
+  synced_at: Date | null;
+}
+
 export interface Database {
   customers: CustomersTable;
   invoices: InvoicesTable;
@@ -117,4 +128,5 @@ export interface Database {
   gateway_settings: GatewaySettingsTable;
   routing_audit: RoutingAuditTable;
   shadow_mismatches: ShadowMismatchesTable;
+  reverse_sync_outbox: ReverseSyncOutboxTable;
 }
