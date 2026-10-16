@@ -9,6 +9,7 @@ import { createDatabase } from '../shared/database/database';
 import { Backfill } from './backfill';
 import { CdcWorker } from './cdc-worker';
 import { ChangeTrackingSource, RetentionExceededError } from './change-tracking';
+import { ParityChecker } from './parity';
 import { ReverseSync } from './reverse-sync';
 
 /**
@@ -78,6 +79,15 @@ async function main(command: string | undefined): Promise<void> {
             () => undefined,
           );
         }
+        break;
+      }
+      case 'parity': {
+        const report = await new ParityChecker(db, legacy, logger, {
+          bucketSize: env.PARITY_BUCKET_SIZE,
+          recheckDelayMs: 30_000,
+        }).run();
+        // Non-zero exit marks the scheduled task as failed in addition to the metric alarm.
+        if (report.mismatches.length > 0) process.exitCode = 2;
         break;
       }
       default:

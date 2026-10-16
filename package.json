@@ -22,7 +22,8 @@
     "sync:backfill": "node --env-file-if-exists=.env dist/sync/main.js backfill",
     "sync:cdc": "node --env-file-if-exists=.env dist/sync/main.js cdc",
     "start:gateway": "node --env-file-if-exists=.env dist/gateway/main.js",
-    "sync:reverse": "node --env-file-if-exists=.env dist/sync/main.js reverse"
+    "sync:reverse": "node --env-file-if-exists=.env dist/sync/main.js reverse",
+    "sync:parity": "node --env-file-if-exists=.env dist/sync/main.js parity"
   },
   "dependencies": {
     "@nestjs/common": "^11.2.3",
