@@ -1,0 +1,808 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Strangler Fig migration of the legacy billing system - RDS SQL Server (legacy, Change
+  Tracking source), Aurora PostgreSQL (modern), ECS Fargate for gateway, billing service and
+  sync workers, Secrets Manager, scheduled parity checks and CloudWatch alarms on replication
+  lag, shadow mismatch rate, parity and split-brain writes.
+
+Parameters:
+  Environment:
+    Type: String
+    AllowedValues: [dev, staging, prod]
+    Default: dev
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+  VpcCidr:
+    Type: String
+    Default: 10.0.0.0/16
+  PrivateSubnetIds:
+    Type: List<AWS::EC2::Subnet::Id>
+    Description: At least two private subnets in different AZs
+  OpsCidr:
+    Type: String
+    Description: CIDR of the ops VPN, the only source allowed on /admin/*
+    Default: 10.200.0.0/16
+  CertificateArn:
+    Type: String
+    Description: ACM certificate for the internal ALB listener
+  ImageUri:
+    Type: String
+    Description: ECR image URI with an immutable tag (git sha); one image, several commands
+  LegacyBaseUrl:
+    Type: String
+    Description: Internal URL of the existing legacy billing app (target of the facade)
+  CreateLegacyDatabase:
+    Type: String
+    AllowedValues: ['true', 'false']
+    Default: 'false'
+    Description: >
+      In production the legacy RDS SQL Server already exists and is passed in via
+      LegacyDbEndpoint; 'true' creates one (dev/staging rehearsals).
+  LegacyDbEndpoint:
+    Type: String
+    Default: ''
+  ReverseSyncDesiredCount:
+    Type: Number
+    AllowedValues: [0, 1]
+    Default: 0
+    Description: 1 only while modern owns customer writes for some tenant (ADR 0003)
+  AlarmTopicArn:
+    Type: String
+    Default: ''
+
+Conditions:
+  IsProd: !Equals [!Ref Environment, prod]
+  CreateLegacy: !Equals [!Ref CreateLegacyDatabase, 'true']
+  HasAlarmTopic: !Not [!Equals [!Ref AlarmTopicArn, '']]
+
+Resources:
+  # ---------- Networking ----------
+  AlbSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Internal ALB in front of the strangler gateway
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: !Ref VpcCidr
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: !Ref OpsCidr
+
+  GatewaySecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: strangler gateway tasks
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 3400
+          ToPort: 3400
+          SourceSecurityGroupId: !Ref AlbSecurityGroup
+
+  BillingSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: modern billing service tasks (reachable from the gateway only)
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 3402
+          ToPort: 3402
+          SourceSecurityGroupId: !Ref GatewaySecurityGroup
+
+  SyncSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: sync workers (CDC, backfill, reverse sync, parity); egress only
+      VpcId: !Ref VpcId
+
+  AuroraSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Aurora PostgreSQL (modern)
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 5432
+          ToPort: 5432
+          SourceSecurityGroupId: !Ref GatewaySecurityGroup
+        - IpProtocol: tcp
+          FromPort: 5432
+          ToPort: 5432
+          SourceSecurityGroupId: !Ref BillingSecurityGroup
+        - IpProtocol: tcp
+          FromPort: 5432
+          ToPort: 5432
+          SourceSecurityGroupId: !Ref SyncSecurityGroup
+
+  LegacyDbSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Condition: CreateLegacy
+    Properties:
+      GroupDescription: RDS SQL Server (legacy) - sync workers only from this stack
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 1433
+          ToPort: 1433
+          SourceSecurityGroupId: !Ref SyncSecurityGroup
+
+  DbSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupDescription: strangler migration databases
+      SubnetIds: !Ref PrivateSubnetIds
+
+  # ---------- Legacy: RDS SQL Server ----------
+  # Change Tracking is enabled with T-SQL after creation (legacy/sql/001_database.sql);
+  # it needs no SQL Server Agent, unlike CDC (ADR 0002).
+  LegacyDb:
+    Type: AWS::RDS::DBInstance
+    Condition: CreateLegacy
+    DeletionPolicy: Snapshot
+    UpdateReplacePolicy: Snapshot
+    Properties:
+      Engine: sqlserver-se
+      EngineVersion: 15.00.4385.2.v1
+      LicenseModel: license-included
+      DBInstanceClass: db.m6i.xlarge
+      AllocatedStorage: '200'
+      StorageType: gp3
+      StorageEncrypted: true
+      MultiAZ: !If [IsProd, true, false]
+      MasterUsername: legacy_admin
+      ManageMasterUserPassword: true
+      DBSubnetGroupName: !Ref DbSubnetGroup
+      VPCSecurityGroups: [!Ref LegacyDbSecurityGroup]
+      BackupRetentionPeriod: 7
+      DeletionProtection: !If [IsProd, true, false]
+      EnablePerformanceInsights: true
+      CopyTagsToSnapshot: true
+
+  # Least-privilege login for the sync workers: VIEW CHANGE TRACKING + SELECT on the two
+  # tables, EXECUTE on usp_SyncCustomerFromModern. Created in SQL Server by the DBA (runbook).
+  LegacySyncCredentials:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Description: SQL Server login used by the sync workers
+      GenerateSecretString:
+        SecretStringTemplate: '{"username":"sync_worker"}'
+        GenerateStringKey: password
+        PasswordLength: 32
+        ExcludeCharacters: '"@/\;'''
+
+  GatewayAdminToken:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Description: Token for the gateway admin API (flags, kill switch, ownership)
+      GenerateSecretString:
+        PasswordLength: 48
+        ExcludePunctuation: true
+
+  # ---------- Modern: Aurora PostgreSQL ----------
+  AuroraCluster:
+    Type: AWS::RDS::DBCluster
+    DeletionPolicy: Snapshot
+    UpdateReplacePolicy: Snapshot
+    Properties:
+      Engine: aurora-postgresql
+      EngineVersion: '16.4'
+      DatabaseName: billing
+      MasterUsername: billing_admin
+      ManageMasterUserPassword: true
+      StorageEncrypted: true
+      DeletionProtection: !If [IsProd, true, false]
+      BackupRetentionPeriod: !If [IsProd, 35, 7]
+      EnableIAMDatabaseAuthentication: true
+      DBSubnetGroupName: !Ref DbSubnetGroup
+      VpcSecurityGroupIds: [!Ref AuroraSecurityGroup]
+      ServerlessV2ScalingConfiguration:
+        MinCapacity: !If [IsProd, 2, 0.5]
+        MaxCapacity: !If [IsProd, 32, 4]
+
+  AuroraWriter:
+    Type: AWS::RDS::DBInstance
+    Properties:
+      DBClusterIdentifier: !Ref AuroraCluster
+      DBInstanceClass: db.serverless
+      Engine: aurora-postgresql
+      EnablePerformanceInsights: true
+
+  AuroraReader:
+    Type: AWS::RDS::DBInstance
+    Condition: IsProd
+    Properties:
+      DBClusterIdentifier: !Ref AuroraCluster
+      DBInstanceClass: db.serverless
+      Engine: aurora-postgresql
+      EnablePerformanceInsights: true
+
+  # ---------- Compute ----------
+  Cluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterSettings:
+        - Name: containerInsights
+          Value: enabled
+      ServiceConnectDefaults:
+        Namespace: !GetAtt Namespace.Arn
+
+  Namespace:
+    Type: AWS::ServiceDiscovery::HttpNamespace
+    Properties:
+      Name: !Sub strangler-${Environment}
+
+  LogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /ecs/strangler-migration-${Environment}
+      RetentionInDays: !If [IsProd, 90, 14]
+
+  ExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Service: ecs-tasks.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
+      Policies:
+        - PolicyName: read-secrets
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: secretsmanager:GetSecretValue
+                Resource:
+                  - !GetAtt AuroraCluster.MasterUserSecret.SecretArn
+                  - !Ref LegacySyncCredentials
+                  - !Ref GatewayAdminToken
+
+  TaskRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Service: ecs-tasks.amazonaws.com }
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: tracing
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: [xray:PutTraceSegments, xray:PutTelemetryRecords]
+                Resource: '*'
+
+  GatewayTaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Sub strangler-gateway-${Environment}
+      Cpu: '512'
+      Memory: '1024'
+      NetworkMode: awsvpc
+      RequiresCompatibilities: [FARGATE]
+      RuntimePlatform: { CpuArchitecture: ARM64, OperatingSystemFamily: LINUX }
+      ExecutionRoleArn: !GetAtt ExecutionRole.Arn
+      TaskRoleArn: !GetAtt TaskRole.Arn
+      ContainerDefinitions:
+        - Name: app
+          Image: !Ref ImageUri
+          Command: [node, dist/gateway/main.js]
+          Essential: true
+          PortMappings: [{ ContainerPort: 3400, Name: gateway }]
+          StopTimeout: 30
+          Environment:
+            - { Name: NODE_ENV, Value: production }
+            - { Name: PORT, Value: '3400' }
+            - { Name: LEGACY_BASE_URL, Value: !Ref LegacyBaseUrl }
+            - { Name: MODERN_BASE_URL, Value: 'http://billing:3402' }
+            - { Name: DB_HOST, Value: !GetAtt AuroraCluster.Endpoint.Address }
+            - { Name: FLAG_CACHE_TTL_MS, Value: '2000' }
+            - { Name: OTEL_EXPORTER_OTLP_ENDPOINT, Value: 'http://localhost:4318' }
+          Secrets:
+            - Name: DB_USERNAME
+              ValueFrom: !Sub '${AuroraCluster.MasterUserSecret.SecretArn}:username::'
+            - Name: DB_PASSWORD
+              ValueFrom: !Sub '${AuroraCluster.MasterUserSecret.SecretArn}:password::'
+            - Name: ADMIN_TOKEN
+              ValueFrom: !Ref GatewayAdminToken
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref LogGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: gateway
+        - Name: otel-collector
+          Image: public.ecr.aws/aws-observability/aws-otel-collector:v0.41.1
+          Essential: false
+          Command: [--config=/etc/ecs/ecs-default-config.yaml]
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref LogGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: otel
+
+  BillingTaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Sub billing-service-${Environment}
+      Cpu: '512'
+      Memory: '1024'
+      NetworkMode: awsvpc
+      RequiresCompatibilities: [FARGATE]
+      RuntimePlatform: { CpuArchitecture: ARM64, OperatingSystemFamily: LINUX }
+      ExecutionRoleArn: !GetAtt ExecutionRole.Arn
+      TaskRoleArn: !GetAtt TaskRole.Arn
+      ContainerDefinitions:
+        - Name: app
+          Image: !Ref ImageUri
+          Command: [node, dist/billing/main.js]
+          Essential: true
+          PortMappings: [{ ContainerPort: 3402, Name: billing }]
+          StopTimeout: 30
+          Environment:
+            - { Name: NODE_ENV, Value: production }
+            - { Name: PORT, Value: '3402' }
+            - { Name: DB_HOST, Value: !GetAtt AuroraCluster.Endpoint.Address }
+          Secrets:
+            - Name: DB_USERNAME
+              ValueFrom: !Sub '${AuroraCluster.MasterUserSecret.SecretArn}:username::'
+            - Name: DB_PASSWORD
+              ValueFrom: !Sub '${AuroraCluster.MasterUserSecret.SecretArn}:password::'
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref LogGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: billing
+
+  # One task definition for every sync command; the command is chosen per service / task.
+  SyncTaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Sub sync-worker-${Environment}
+      Cpu: '512'
+      Memory: '1024'
+      NetworkMode: awsvpc
+      RequiresCompatibilities: [FARGATE]
+      RuntimePlatform: { CpuArchitecture: ARM64, OperatingSystemFamily: LINUX }
+      ExecutionRoleArn: !GetAtt ExecutionRole.Arn
+      TaskRoleArn: !GetAtt TaskRole.Arn
+      ContainerDefinitions:
+        - Name: app
+          Image: !Ref ImageUri
+          Command: [node, dist/sync/main.js, cdc]
+          Essential: true
+          StopTimeout: 30
+          Environment:
+            - { Name: NODE_ENV, Value: production }
+            - { Name: DB_HOST, Value: !GetAtt AuroraCluster.Endpoint.Address }
+            - Name: LEGACY_DB_HOST
+              Value: !If [CreateLegacy, !GetAtt LegacyDb.Endpoint.Address, !Ref LegacyDbEndpoint]
+            - { Name: LEGACY_DB_NAME, Value: LegacyBilling }
+            - { Name: SYNC_BATCH_SIZE, Value: '500' }
+            - { Name: BACKFILL_MAX_ROWS_PER_SECOND, Value: '2000' }
+          Secrets:
+            - Name: DB_USERNAME
+              ValueFrom: !Sub '${AuroraCluster.MasterUserSecret.SecretArn}:username::'
+            - Name: DB_PASSWORD
+              ValueFrom: !Sub '${AuroraCluster.MasterUserSecret.SecretArn}:password::'
+            - Name: LEGACY_DB_USER
+              ValueFrom: !Sub '${LegacySyncCredentials}:username::'
+            - Name: LEGACY_DB_PASSWORD
+              ValueFrom: !Sub '${LegacySyncCredentials}:password::'
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref LogGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: sync
+
+  Alb:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Scheme: internal
+      Subnets: !Ref PrivateSubnetIds
+      SecurityGroups: [!Ref AlbSecurityGroup]
+
+  GatewayTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      VpcId: !Ref VpcId
+      Protocol: HTTP
+      Port: 3400
+      TargetType: ip
+      HealthCheckPath: /health/ready
+      HealthCheckIntervalSeconds: 10
+      HealthyThresholdCount: 2
+      TargetGroupAttributes:
+        - Key: deregistration_delay.timeout_seconds
+          Value: '20'
+
+  HttpsListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref Alb
+      Port: 443
+      Protocol: HTTPS
+      SslPolicy: ELBSecurityPolicy-TLS13-1-2-2021-06
+      Certificates: [{ CertificateArn: !Ref CertificateArn }]
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref GatewayTargetGroup
+
+  # /admin/* is answered with 403 unless the request comes from the ops VPN.
+  AdminFromOps:
+    Type: AWS::ElasticLoadBalancingV2::ListenerRule
+    Properties:
+      ListenerArn: !Ref HttpsListener
+      Priority: 10
+      Conditions:
+        - Field: path-pattern
+          PathPatternConfig: { Values: ['/admin/*'] }
+        - Field: source-ip
+          SourceIpConfig: { Values: [!Ref OpsCidr] }
+      Actions:
+        - Type: forward
+          TargetGroupArn: !Ref GatewayTargetGroup
+
+  AdminDenied:
+    Type: AWS::ElasticLoadBalancingV2::ListenerRule
+    Properties:
+      ListenerArn: !Ref HttpsListener
+      Priority: 20
+      Conditions:
+        - Field: path-pattern
+          PathPatternConfig: { Values: ['/admin/*'] }
+      Actions:
+        - Type: fixed-response
+          FixedResponseConfig: { StatusCode: '403', ContentType: application/json, MessageBody: '{"error":"FORBIDDEN"}' }
+
+  GatewayService:
+    Type: AWS::ECS::Service
+    DependsOn: HttpsListener
+    Properties:
+      Cluster: !Ref Cluster
+      LaunchType: FARGATE
+      TaskDefinition: !Ref GatewayTaskDefinition
+      DesiredCount: !If [IsProd, 3, 2]
+      DeploymentConfiguration:
+        MinimumHealthyPercent: 100
+        MaximumPercent: 200
+        DeploymentCircuitBreaker: { Enable: true, Rollback: true }
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          Subnets: !Ref PrivateSubnetIds
+          SecurityGroups: [!Ref GatewaySecurityGroup]
+          AssignPublicIp: DISABLED
+      ServiceConnectConfiguration:
+        Enabled: true
+      LoadBalancers:
+        - ContainerName: app
+          ContainerPort: 3400
+          TargetGroupArn: !Ref GatewayTargetGroup
+
+  BillingService:
+    Type: AWS::ECS::Service
+    Properties:
+      Cluster: !Ref Cluster
+      LaunchType: FARGATE
+      TaskDefinition: !Ref BillingTaskDefinition
+      DesiredCount: !If [IsProd, 3, 2]
+      DeploymentConfiguration:
+        MinimumHealthyPercent: 100
+        MaximumPercent: 200
+        DeploymentCircuitBreaker: { Enable: true, Rollback: true }
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          Subnets: !Ref PrivateSubnetIds
+          SecurityGroups: [!Ref BillingSecurityGroup]
+          AssignPublicIp: DISABLED
+      ServiceConnectConfiguration:
+        Enabled: true
+        Services:
+          - PortName: billing
+            ClientAliases: [{ Port: 3402, DnsName: billing }]
+
+  # Exactly one CDC worker: the checkpoint row lock would serialize more anyway.
+  CdcService:
+    Type: AWS::ECS::Service
+    Properties:
+      Cluster: !Ref Cluster
+      LaunchType: FARGATE
+      TaskDefinition: !Ref SyncTaskDefinition
+      DesiredCount: 1
+      DeploymentConfiguration:
+        MinimumHealthyPercent: 0
+        MaximumPercent: 100
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          Subnets: !Ref PrivateSubnetIds
+          SecurityGroups: [!Ref SyncSecurityGroup]
+          AssignPublicIp: DISABLED
+
+  ReverseSyncTaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Sub reverse-sync-${Environment}
+      Cpu: '256'
+      Memory: '512'
+      NetworkMode: awsvpc
+      RequiresCompatibilities: [FARGATE]
+      RuntimePlatform: { CpuArchitecture: ARM64, OperatingSystemFamily: LINUX }
+      ExecutionRoleArn: !GetAtt ExecutionRole.Arn
+      TaskRoleArn: !GetAtt TaskRole.Arn
+      ContainerDefinitions:
+        - Name: app
+          Image: !Ref ImageUri
+          Command: [node, dist/sync/main.js, reverse]
+          Essential: true
+          Environment:
+            - { Name: NODE_ENV, Value: production }
+            - { Name: DB_HOST, Value: !GetAtt AuroraCluster.Endpoint.Address }
+            - Name: LEGACY_DB_HOST
+              Value: !If [CreateLegacy, !GetAtt LegacyDb.Endpoint.Address, !Ref LegacyDbEndpoint]
+            - { Name: LEGACY_DB_NAME, Value: LegacyBilling }
+          Secrets:
+            - Name: DB_USERNAME
+              ValueFrom: !Sub '${AuroraCluster.MasterUserSecret.SecretArn}:username::'
+            - Name: DB_PASSWORD
+              ValueFrom: !Sub '${AuroraCluster.MasterUserSecret.SecretArn}:password::'
+            - Name: LEGACY_DB_USER
+              ValueFrom: !Sub '${LegacySyncCredentials}:username::'
+            - Name: LEGACY_DB_PASSWORD
+              ValueFrom: !Sub '${LegacySyncCredentials}:password::'
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref LogGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: reverse-sync
+
+  # Ordered, single consumer of the reverse-sync outbox (never more than 1).
+  ReverseSyncService:
+    Type: AWS::ECS::Service
+    Properties:
+      Cluster: !Ref Cluster
+      LaunchType: FARGATE
+      TaskDefinition: !Ref ReverseSyncTaskDefinition
+      DesiredCount: !Ref ReverseSyncDesiredCount
+      DeploymentConfiguration:
+        MinimumHealthyPercent: 0
+        MaximumPercent: 100
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          Subnets: !Ref PrivateSubnetIds
+          SecurityGroups: [!Ref SyncSecurityGroup]
+          AssignPublicIp: DISABLED
+
+  # ---------- Scheduled parity check ----------
+  SchedulerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Service: scheduler.amazonaws.com }
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: run-parity-task
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: ecs:RunTask
+                Resource: !Ref SyncTaskDefinition
+              - Effect: Allow
+                Action: iam:PassRole
+                Resource: [!GetAtt ExecutionRole.Arn, !GetAtt TaskRole.Arn]
+
+  ParitySchedule:
+    Type: AWS::Scheduler::Schedule
+    Properties:
+      Description: Hourly data-parity check (counts + checksums per partition)
+      ScheduleExpression: rate(1 hour)
+      FlexibleTimeWindow: { Mode: 'OFF' }
+      Target:
+        Arn: !GetAtt Cluster.Arn
+        RoleArn: !GetAtt SchedulerRole.Arn
+        EcsParameters:
+          TaskDefinitionArn: !Ref SyncTaskDefinition
+          LaunchType: FARGATE
+          NetworkConfiguration:
+            AwsvpcConfiguration:
+              Subnets: !Ref PrivateSubnetIds
+              SecurityGroups: [!Ref SyncSecurityGroup]
+              AssignPublicIp: DISABLED
+        Input: '{"containerOverrides":[{"name":"app","command":["node","dist/sync/main.js","parity"]}]}'
+
+  # ---------- Alarms ----------
+  ReplicationLagAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: >
+        CDC lag above 15 minutes (runbook#replication-lag). Missing data means the worker
+        is not running and is treated as breaching. Change Tracking retention is 3 days.
+      Namespace: StranglerMigration
+      MetricName: ReplicationLagSeconds
+      Dimensions: [{ Name: Stream, Value: customers }]
+      Statistic: Maximum
+      Period: 60
+      EvaluationPeriods: 15
+      DatapointsToAlarm: 15
+      Threshold: 900
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: breaching
+      AlarmActions: !If [HasAlarmTopic, [!Ref AlarmTopicArn], !Ref AWS::NoValue]
+
+  InvoiceReplicationLagAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: CDC lag above 15 minutes on invoices (runbook#replication-lag)
+      Namespace: StranglerMigration
+      MetricName: ReplicationLagSeconds
+      Dimensions: [{ Name: Stream, Value: invoices }]
+      Statistic: Maximum
+      Period: 60
+      EvaluationPeriods: 15
+      DatapointsToAlarm: 15
+      Threshold: 900
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: breaching
+      AlarmActions: !If [HasAlarmTopic, [!Ref AlarmTopicArn], !Ref AWS::NoValue]
+
+  ShadowMismatchRateAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: >
+        Shadow mismatch rate above 0.5% over 15 minutes on customers.get
+        (runbook#shadow-mismatch). Exit criterion for every read phase.
+      Metrics:
+        - Id: mismatched
+          ReturnData: false
+          MetricStat:
+            Metric:
+              Namespace: StranglerMigration
+              MetricName: ShadowMismatch
+              Dimensions: [{ Name: Route, Value: customers.get }]
+            Period: 300
+            Stat: Sum
+        - Id: compared
+          ReturnData: false
+          MetricStat:
+            Metric:
+              Namespace: StranglerMigration
+              MetricName: ShadowCompared
+              Dimensions: [{ Name: Route, Value: customers.get }]
+            Period: 300
+            Stat: Sum
+        - Id: rate
+          Expression: IF(compared >= 100, 100 * mismatched / compared, 0)
+          Label: Shadow mismatch rate (%)
+          ReturnData: true
+      EvaluationPeriods: 3
+      Threshold: 0.5
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: !If [HasAlarmTopic, [!Ref AlarmTopicArn], !Ref AWS::NoValue]
+
+  InvoiceShadowMismatchRateAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: Shadow mismatch rate above 0.5% on invoices.list (runbook#shadow-mismatch)
+      Metrics:
+        - Id: mismatched
+          ReturnData: false
+          MetricStat:
+            Metric:
+              Namespace: StranglerMigration
+              MetricName: ShadowMismatch
+              Dimensions: [{ Name: Route, Value: invoices.list }]
+            Period: 300
+            Stat: Sum
+        - Id: compared
+          ReturnData: false
+          MetricStat:
+            Metric:
+              Namespace: StranglerMigration
+              MetricName: ShadowCompared
+              Dimensions: [{ Name: Route, Value: invoices.list }]
+            Period: 300
+            Stat: Sum
+        - Id: rate
+          Expression: IF(compared >= 100, 100 * mismatched / compared, 0)
+          Label: Shadow mismatch rate (%)
+          ReturnData: true
+      EvaluationPeriods: 3
+      Threshold: 0.5
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: !If [HasAlarmTopic, [!Ref AlarmTopicArn], !Ref AWS::NoValue]
+
+  ParityAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: Parity checker found mismatching partitions after recheck (runbook#parity-mismatch)
+      Namespace: StranglerMigration
+      MetricName: ParityMismatchedPartitions
+      Statistic: Maximum
+      Period: 3600
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: breaching
+      AlarmActions: !If [HasAlarmTopic, [!Ref AlarmTopicArn], !Ref AWS::NoValue]
+
+  DeadLetterAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: >
+        Rows dead-lettered by the sync (ACL rejection, orphan, or a legacy write to an entity
+        modern owns) - runbook#dead-letters
+      Namespace: StranglerMigration
+      MetricName: SyncDeadLettered
+      Dimensions: [{ Name: Stream, Value: customers }]
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: !If [HasAlarmTopic, [!Ref AlarmTopicArn], !Ref AWS::NoValue]
+
+  ReverseSyncBacklogAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: Reverse sync backlog growing; legacy falling behind modern writes (runbook#reverse-sync)
+      Namespace: StranglerMigration
+      MetricName: ReverseSyncBacklog
+      Statistic: Maximum
+      Period: 60
+      EvaluationPeriods: 5
+      Threshold: 100
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: !If [HasAlarmTopic, [!Ref AlarmTopicArn], !Ref AWS::NoValue]
+
+  GatewayFallbackAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: Modern reads failing and falling back to legacy (runbook#fallbacks)
+      Namespace: StranglerMigration
+      MetricName: GatewayFallback
+      Dimensions: [{ Name: Route, Value: customers.get }]
+      Statistic: Sum
+      Period: 60
+      EvaluationPeriods: 5
+      DatapointsToAlarm: 3
+      Threshold: 10
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: !If [HasAlarmTopic, [!Ref AlarmTopicArn], !Ref AWS::NoValue]
+
+Outputs:
+  AlbDnsName:
+    Value: !GetAtt Alb.DNSName
+  AuroraEndpoint:
+    Value: !GetAtt AuroraCluster.Endpoint.Address
+  AuroraSecretArn:
+    Value: !GetAtt AuroraCluster.MasterUserSecret.SecretArn
+  LegacySyncSecretArn:
+    Value: !Ref LegacySyncCredentials
+  ClusterName:
+    Value: !Ref Cluster
+  SyncTaskDefinitionArn:
+    Description: Run one-off with command override (backfill) - see runbook
+    Value: !Ref SyncTaskDefinition
