@@ -44,9 +44,15 @@ export class FacadeController {
       body: req.body as unknown,
     };
 
+    const flags = await this.flags.snapshot();
+    if (flags.unavailable && matched?.route.kind === 'write') {
+      res.status(503).setHeader('retry-after', '5').json({ error: 'SERVICE_UNAVAILABLE' });
+      return;
+    }
+
     // Unmatched routes always go to legacy: the facade never breaks an endpoint it does not know.
     const decision: Decision | { target: Target; shadow: false; reason: 'unmatched' } = matched
-      ? decide(matched.route, tenantId, matched.resourceId ?? tenantId, await this.flags.snapshot())
+      ? decide(matched.route, tenantId, matched.resourceId ?? tenantId, flags)
       : { target: 'legacy', shadow: false, reason: 'unmatched' };
 
     let served: Target = decision.target;

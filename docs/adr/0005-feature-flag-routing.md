@@ -38,5 +38,5 @@ Flags are rows in PostgreSQL (`routing_rules`, `entity_ownership`, `gateway_sett
 
 - Rollback of any read route is one API call and needs no deployment; the time to full effect is bounded by the cache TTL, not by DNS.
 - Customer-level stickiness hides replication lag from users during canary phases; a customer only changes side when the percentage changes.
-- The gateway is on the critical path of every call: it runs ≥ 2 tasks across AZs, has no state other than a 2-second cache, and degrades to "everything to legacy" if it cannot read flags at start-up (fail-safe default).
+- The gateway is on the critical path of every call: it runs ≥ 2 tasks across AZs, has no state other than a 2-second cache, and if PostgreSQL is unreachable it keeps routing with the last known flags; with none (cold start during an outage) reads go to legacy and writes are refused with `503`, because sending a write to a system that may not own the entity would break the single-writer rule.
 - Storing flags in AppConfig (with its deployment strategies and rollback alarms) is a drop-in change of `FlagStore`; we kept PostgreSQL to have one less moving part in the local stack and transactional audit rows.

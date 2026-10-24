@@ -1,4 +1,4 @@
-import { Inject, Injectable } from '@nestjs/common';
+import { Inject, Injectable, Logger } from '@nestjs/common';
 import { type Kysely, sql } from 'kysely';
 import type { GatewayEnv } from '../shared/config/env';
 import type { Database, Entity, Owner } from '../shared/database/schema';
@@ -12,7 +12,9 @@ import { type FlagSnapshot, ownerKey, type RouteRule } from './flags';
  */
 @Injectable()
 export class FlagStore {
+  private readonly logger = new Logger(FlagStore.name);
   private cached: { snapshot: FlagSnapshot; at: number } | undefined;
+  private lastKnown: FlagSnapshot | undefined;
 
   constructor(
     @Inject(DB) private readonly db: Kysely<Database>,
@@ -23,6 +25,22 @@ export class FlagStore {
     const now = Date.now();
     if (this.cached && now - this.cached.at < this.env.FLAG_CACHE_TTL_MS)
       return this.cached.snapshot;
+    try {
+      const snapshot = await this.load();
+      this.cached = { snapshot, at: now };
+      this.lastKnown = snapshot;
+      return snapshot;
+    } catch (error) {
+      // Fail safe: keep routing with the last known flags; with none, everything reads from
+      // legacy and writes are refused by the facade (the owner is unknown).
+      this.logger.error({ err: error }, 'cannot load routing flags');
+      return (
+        this.lastKnown ?? { killSwitch: true, rules: [], owners: new Map(), unavailable: true }
+      );
+    }
+  }
+
+  private async load(): Promise<FlagSnapshot> {
     const [settings, rules, owners] = await Promise.all([
       this.db.selectFrom('gateway_settings').select('kill_switch').executeTakeFirst(),
       this.db.selectFrom('routing_rules').selectAll().execute(),
@@ -38,7 +56,6 @@ export class FlagStore {
       })),
       owners: new Map(owners.map((row) => [ownerKey(row.entity, row.tenant_id), row.owner])),
     };
-    this.cached = { snapshot, at: now };
     return snapshot;
   }
 

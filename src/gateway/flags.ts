@@ -19,6 +19,8 @@ export interface FlagSnapshot {
   rules: RouteRule[];
   /** `${entity}:${tenant}` → owner; absent means legacy. */
   owners: Map<string, Owner>;
+  /** Flags could not be loaded and nothing was cached: owners are unknown. */
+  unavailable?: boolean;
 }
 
 export interface Decision {
