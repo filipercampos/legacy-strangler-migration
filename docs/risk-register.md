@@ -1,0 +1,20 @@
+# Risk register
+
+Likelihood / impact: L(ow), M(edium), H(igh). Reviewed at every phase gate.
+
+| ID | Risk | L | I | Mitigation | Detection | Owner | Status |
+|---|---|---|---|---|---|---|---|
+| R-01 | Undocumented legacy behaviour (triggers, nightly jobs) not reproduced by modern | H | H | Shadow reads before any canary; triggers inventoried from `sys.triggers`, jobs from `msdb.dbo.sysjobs` | Shadow mismatch classes; parity | Migration lead | Open — two found so far (`TRG_INV_PAID` unblock, `usp_MarkOverdue` batch) |
+| R-02 | Split-brain write: something still writes to legacy after modern owns the entity | M | H | Single-writer rule; CDC refuses non-owner changes; ownership flip checklist lists every writer | `write_to_non_owner` dead letter (paging) | Tech lead | Mitigated, tested (`test/ownership.int-spec.ts`) |
+| R-03 | `TRG_INV_PAID` updates `TBL_CUST` when an invoice is paid; after the customers ownership flip this becomes a split-brain write | H | M | Move the unblock rule to the modern service (or disable per tenant) before flipping customer ownership; invoices stay legacy-owned until then | `write_to_non_owner` on customers right after payments | Billing team | Open — blocker for phase 4 |
+| R-04 | CDC down longer than Change Tracking retention (3 days) | L | H | Lag alarm at 15 min with missing-data = breaching; retention-exceeded error stops the worker loudly | `ReplicationLagSeconds`, `RetentionExceededError` | On-call | Mitigated; recovery = re-backfill (runbook) |
+| R-05 | Backfill overloads the legacy primary during business hours | M | M | Token-bucket throttle (`BACKFILL_MAX_ROWS_PER_SECOND`), keyset pages, resumable, run off-peak; parity against a read replica where available | RDS CPU / `BackfillThrottled` | DBA | Mitigated |
+| R-06 | Data-quality issues block the load (impossible dates, invalid documents, orphans) | H | M | ACL repairs what is meaningless-but-harmless and records `data_issues`; rejects what is unknowable into dead letters | Dead-letter counts per reason | Data owner | Mitigated; 5 orphans + 11 impossible dates + 31 invalid documents in the seed |
+| R-07 | Lossy translation changes what callers see (invalid document becomes null, overdue computed live) | M | M | Accepted differences listed in ADR 0006 and signed off by the product owner; everything else is a mismatch | Shadow mismatch rate | Product owner | Accepted for the listed rules |
+| R-08 | Gateway becomes a single point of failure / adds latency | M | H | ≥ 2 tasks across AZs, stateless, 2 s flag cache, fail-safe to legacy; circuit-breaker deployments | ALB 5xx, `UpstreamLatency` | Platform | Mitigated; local overhead measured (see local-run) |
+| R-09 | Shadow traffic doubles load on the shadowed side | M | M | Shadow sampling per route/tenant; start at 1 % | Legacy CPU; `ShadowLatencyDelta` | Migration lead | Mitigated |
+| R-10 | IDENTITY reseed in the reverse-sync procedure races with legacy inserts | L | H | Table lock (`TABLOCKX`) inside the procedure; modern ids from a disjoint range ≥ 50,000,000 | Duplicate-key errors in reverse sync; legacy ids ≥ 50 M created by legacy | DBA | Mitigated, tested (legacy insert after a reverse-synced insert keeps legacy range) |
+| R-11 | Month-end billing close coincides with a phase step | M | H | Change freeze days 28–3 in the go/no-go checklist | Change calendar | Migration lead | Mitigated |
+| R-12 | Rollback after ownership flip loses modern-only writes | L | H | Reverse sync keeps legacy complete; rollback waits for backlog = 0 | `ReverseSyncBacklog`, parity | Tech lead | Mitigated |
+| R-13 | PostgreSQL bind-parameter limit on very large legacy transactions | M | M | Projector chunks multi-row statements (found in a local run: a 12,000-row `UPDATE` failed the worker until fixed) | `cdc pass failed` with `08P01` | Tech lead | Closed |
+| R-14 | Callers never leave the compat contract, so the ACL/compat code is never deleted | H | M | Phase 5 tracked per caller with gateway metrics; compat endpoints get a sunset date | `GatewayRequests` per route | Engineering manager | Open |
