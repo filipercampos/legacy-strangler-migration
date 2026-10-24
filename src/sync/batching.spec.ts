@@ -1,4 +1,5 @@
 import { maxVersion, planBatch } from './batching';
+import { chunks } from './projector';
 
 const at = (...versions: number[]) => versions.map((v, i) => ({ version: BigInt(v), id: i }));
 
@@ -20,5 +21,13 @@ describe('planBatch', () => {
   it('checkpoints at the highest applied version', () => {
     expect(maxVersion(at(3, 8, 4), 1n)).toBe(8n);
     expect(maxVersion([], 12n)).toBe(12n);
+  });
+});
+
+describe('chunks', () => {
+  it('splits large row sets below the PostgreSQL bind-parameter limit', () => {
+    const sizes = chunks(Array.from({ length: 2_501 }, (_, i) => i)).map((c) => c.length);
+    expect(sizes).toEqual([1_000, 1_000, 501]);
+    expect(chunks([])).toEqual([]);
   });
 });

@@ -6,6 +6,19 @@ import { customerColumns, invoiceColumns } from '../billing/persistence/mappers'
 import type { Database } from '../shared/database/schema';
 import { type Change, type StreamName, SYNC_CONTEXT } from './change-tracking';
 
+/**
+ * PostgreSQL caps a statement at 65,535 bind parameters. A single legacy transaction can
+ * touch tens of thousands of rows (one Change Tracking version, read unbounded), so every
+ * multi-row statement is chunked.
+ */
+const CHUNK = 1_000;
+
+export function chunks<T>(items: T[], size = CHUNK): T[][] {
+  const result: T[][] = [];
+  for (let i = 0; i < items.length; i += size) result.push(items.slice(i, i + size));
+  return result;
+}
+
 export interface ProjectionStats {
   applied: number;
   tombstoned: number;
@@ -79,21 +92,21 @@ export class Projector {
     // looked orphaned during the backfill because its customer was created mid-copy).
     const rejected = new Set(deadLetters.map((letter) => letter.legacyId));
     const healed = live.map((change) => change.key).filter((key) => !rejected.has(key));
-    if (healed.length > 0) {
+    for (const keys of chunks(healed)) {
       await trx
         .updateTable('sync_dead_letters')
         .set({ resolved_at: sql<Date>`now()` })
         .where('stream', '=', stream)
-        .where('legacy_id', 'in', healed)
+        .where('legacy_id', 'in', keys)
         .where('resolved_at', 'is', null)
         .execute();
     }
 
-    if (deadLetters.length > 0) {
+    for (const letters of chunks(deadLetters)) {
       await trx
         .insertInto('sync_dead_letters')
         .values(
-          deadLetters.map((letter) => ({
+          letters.map((letter) => ({
             stream,
             legacy_id: letter.legacyId,
             source_version: letter.version,
@@ -104,8 +117,8 @@ export class Projector {
         )
         .onConflict((oc) => oc.columns(['stream', 'legacy_id', 'source_version']).doNothing())
         .execute();
-      stats.deadLettered = deadLetters.length;
     }
+    stats.deadLettered = deadLetters.length;
     return stats;
   }
 
@@ -137,10 +150,10 @@ export class Projector {
       }
     }
 
-    if (upserts.length > 0) {
+    for (const chunk of chunks(upserts)) {
       await trx
         .insertInto('customers')
-        .values(upserts)
+        .values(chunk)
         .onConflict((oc) =>
           oc
             .column('legacy_id')
@@ -165,7 +178,7 @@ export class Projector {
             .where('customers.source_version', '<', (eb) => eb.ref('excluded.source_version')),
         )
         .execute();
-      stats.applied += upserts.length;
+      stats.applied += chunk.length;
     }
 
     for (const tombstone of tombstones) {
@@ -212,11 +225,11 @@ export class Projector {
 
     // No FK in legacy: invoices may point at customers that never existed.
     const customerIds = [...new Set(translated.map((t) => t.result.invoice.snapshot.customerId))];
-    const existing = new Set(
-      (await trx.selectFrom('customers').select('id').where('id', 'in', customerIds).execute()).map(
-        (row) => row.id,
-      ),
-    );
+    const existing = new Set<string>();
+    for (const ids of chunks(customerIds)) {
+      const rows = await trx.selectFrom('customers').select('id').where('id', 'in', ids).execute();
+      for (const row of rows) existing.add(row.id);
+    }
 
     const upserts = [];
     for (const { change, result } of translated) {
@@ -238,31 +251,31 @@ export class Projector {
         source_version: change.version,
       });
     }
-    if (upserts.length === 0) return;
-
-    await trx
-      .insertInto('invoices')
-      .values(upserts)
-      .onConflict((oc) =>
-        oc
-          .column('legacy_id')
-          .doUpdateSet((eb) => ({
-            customer_id: eb.ref('excluded.customer_id'),
-            period: eb.ref('excluded.period'),
-            due_date: eb.ref('excluded.due_date'),
-            amount_cents: eb.ref('excluded.amount_cents'),
-            status: eb.ref('excluded.status'),
-            void_reason: eb.ref('excluded.void_reason'),
-            paid_on: eb.ref('excluded.paid_on'),
-            notes: eb.ref('excluded.notes'),
-            data_issues: eb.ref('excluded.data_issues'),
-            source_version: eb.ref('excluded.source_version'),
-            updated_at: sql<Date>`now()`,
-          }))
-          .where('invoices.source_version', '<', (eb) => eb.ref('excluded.source_version')),
-      )
-      .execute();
-    stats.applied += upserts.length;
+    for (const chunk of chunks(upserts)) {
+      await trx
+        .insertInto('invoices')
+        .values(chunk)
+        .onConflict((oc) =>
+          oc
+            .column('legacy_id')
+            .doUpdateSet((eb) => ({
+              customer_id: eb.ref('excluded.customer_id'),
+              period: eb.ref('excluded.period'),
+              due_date: eb.ref('excluded.due_date'),
+              amount_cents: eb.ref('excluded.amount_cents'),
+              status: eb.ref('excluded.status'),
+              void_reason: eb.ref('excluded.void_reason'),
+              paid_on: eb.ref('excluded.paid_on'),
+              notes: eb.ref('excluded.notes'),
+              data_issues: eb.ref('excluded.data_issues'),
+              source_version: eb.ref('excluded.source_version'),
+              updated_at: sql<Date>`now()`,
+            }))
+            .where('invoices.source_version', '<', (eb) => eb.ref('excluded.source_version')),
+        )
+        .execute();
+      stats.applied += chunk.length;
+    }
   }
 }
 
